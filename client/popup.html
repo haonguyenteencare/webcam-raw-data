@@ -11,6 +11,7 @@
       <h1>Meet Raw Data PoC</h1>
       <div class="actions">
         <button id="save-identity" type="button">Save identity</button>
+        <button id="sync-now" type="button">Sync Now</button>
         <button id="viewer" type="button">Viewer</button>
         <button id="export" type="button">Export</button>
         <button id="clear" type="button">Clear</button>
@@ -39,6 +40,18 @@
     </section>
 
     <section id="summary" class="summary">Waiting for Google Meet media...</section>
+    
+    <section id="status-indicators" class="panel status-panel">
+      <div class="indicator">
+        <span class="label">Server (8787):</span>
+        <span id="server-status" class="value unknown">Checking...</span>
+      </div>
+      <div class="indicator">
+        <span class="label">Pending Uploads:</span>
+        <span id="pending-count" class="value">0</span>
+      </div>
+    </section>
+
     <section id="status">Waiting for Google Meet media...</section>
     <main id="events"></main>
 

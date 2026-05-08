@@ -1,4 +1,5 @@
 const saveIdentityButton = document.querySelector("#save-identity");
+const syncNowButton = document.querySelector("#sync-now");
 const studentLabelInput = document.querySelector("#student-label");
 const consentGrantedInput = document.querySelector("#consent-granted");
 const researchRawModeInput = document.querySelector("#research-raw-mode");
@@ -8,6 +9,27 @@ const summaryElement = document.querySelector("#summary");
 const clearButton = document.querySelector("#clear");
 const exportButton = document.querySelector("#export");
 const viewerButton = document.querySelector("#viewer");
+const serverStatusElement = document.querySelector("#server-status");
+const pendingCountElement = document.querySelector("#pending-count");
+
+const checkServer = async () => {
+    try {
+        const result = await chrome.runtime.sendMessage({ type: "check-server" });
+        if (result?.connected) {
+            serverStatusElement.textContent = "Connected";
+            serverStatusElement.className = "value online";
+        } else {
+            serverStatusElement.textContent = "Offline";
+            serverStatusElement.className = "value offline";
+        }
+    } catch (e) {
+        serverStatusElement.textContent = "Error";
+        serverStatusElement.className = "value offline";
+    }
+};
+
+setInterval(checkServer, 5000);
+checkServer();
 
 const formatBytes = (bytes) => {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -121,47 +143,116 @@ const render = async () => {
 };
 
 clearButton.addEventListener("click", async () => {
+  if (!confirm("Bạn có chắc chắn muốn xóa toàn bộ dữ liệu phiên này?")) {
+    return;
+  }
+  
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  
   await chrome.storage.local.set({ events: [], sessionSummary: null });
+  
+  if (tab?.id) {
+    await chrome.runtime.sendMessage({ type: "clear-session", tabId: tab.id });
+  }
+  
   await render();
 });
 
 saveIdentityButton.addEventListener("click", async () => {
   const studentLabel = studentLabelInput.value.trim();
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   if (!studentLabel) {
     alert("Vui lòng nhập tên học sinh trước khi lưu!");
     return;
   }
 
-  await chrome.storage.local.set({ studentLabel });
+  const originalText = saveIdentityButton.textContent;
+  saveIdentityButton.disabled = true;
+  saveIdentityButton.textContent = "Đang lưu...";
 
-  let statusMsg = `Đã lưu tên: ${studentLabel}. `;
-  
-  if (tab?.id) {
-    const result = await chrome.runtime.sendMessage({ type: "save-identity", studentLabel, tabId: tab.id });
-    if (!result.ok) {
-        statusMsg += `(Lưu ý: ${result.reason})`;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    await chrome.storage.local.set({ studentLabel });
+
+    let statusMsg = `Đã lưu tên: ${studentLabel}. `;
+
+    if (tab?.id) {
+      const result = await chrome.runtime.sendMessage({
+        type: "save-identity",
+        studentLabel,
+        tabId: tab.id,
+      });
+
+      if (!result.ok) {
+        statusMsg += `(Lưu ý: Lỗi đồng bộ server: ${result.reason})`;
+      } else if (result.updatedSessions === 0) {
+        statusMsg += `(Lưu ý: Không tìm thấy phiên Meet đang chạy để khởi tạo folder)`;
+      }
     }
-  }
 
-  alert(`${statusMsg}\nExtension sẽ chạy ngầm ngay bây giờ.`);
-  window.close(); // Tự động đóng popup
+    alert(`${statusMsg}\nExtension sẽ chạy ngầm ngay bây giờ.`);
+    window.close();
+  } catch (error) {
+    console.error("Save identity failed:", error);
+    alert(`Lỗi khi lưu: ${error.message}`);
+  } finally {
+    saveIdentityButton.disabled = false;
+    saveIdentityButton.textContent = originalText;
+  }
+});
+
+syncNowButton.addEventListener("click", async () => {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+
+  syncNowButton.disabled = true;
+  const originalText = syncNowButton.textContent;
+  syncNowButton.textContent = "Syncing...";
+
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "flush-upload", tabId: tab.id });
+    if (result.ok) {
+      pendingCountElement.textContent = result.pendingCount || "0";
+      alert("Đã gửi lệnh đồng bộ dữ liệu!");
+    } else {
+      alert("Lỗi đồng bộ: " + result.reason);
+    }
+  } catch (e) {
+    alert("Không thể kết nối với background script.");
+  } finally {
+    syncNowButton.disabled = false;
+    syncNowButton.textContent = originalText;
+  }
 });
 
 exportButton.addEventListener("click", async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const originalText = exportButton.textContent;
+  exportButton.disabled = true;
+  exportButton.textContent = "Exporting...";
 
-  if (!tab?.id) {
-    statusElement.textContent = "No active Meet tab found.";
-    return;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+    if (!tab?.id) {
+      alert("Không tìm thấy tab Google Meet đang hoạt động.");
+      return;
+    }
+
+    const result = await chrome.runtime.sendMessage({ type: "export-session", tabId: tab.id });
+
+    if (result.ok) {
+      statusElement.textContent = `Downloaded ${result.filename} with ${result.eventCount} event(s).`;
+    } else {
+      alert(`Export thất bại: ${result.reason}`);
+      statusElement.textContent = `Export failed: ${result.reason}`;
+    }
+  } catch (error) {
+    console.error("Export error:", error);
+    alert(`Lỗi khi export: ${error.message}. Bạn có thể thử Export từ trang Viewer.`);
+  } finally {
+    exportButton.disabled = false;
+    exportButton.textContent = originalText;
   }
-
-  const result = await chrome.runtime.sendMessage({ type: "export-session", tabId: tab.id });
-
-  statusElement.textContent = result.ok
-    ? `Downloaded ${result.filename} with ${result.eventCount} event(s).`
-    : `Export failed: ${result.reason}`;
 });
 
 viewerButton.addEventListener("click", async () => {

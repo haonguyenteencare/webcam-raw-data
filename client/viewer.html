@@ -9,7 +9,11 @@
   <body>
     <header>
       <h1>Meet Raw Data Viewer</h1>
-      <input id="file" type="file" accept="application/json,.json">
+      <div class="actions">
+        <button id="export-session" type="button" class="primary-btn">Export Current Session</button>
+        <div class="spacer"></div>
+        <input id="file" type="file" accept="application/json,.json">
+      </div>
     </header>
 
     <section id="summary">Choose an exported session JSON file.</section>

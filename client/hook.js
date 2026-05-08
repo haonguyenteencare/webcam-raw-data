@@ -154,11 +154,13 @@
       "audio/webm;codecs=opus",
       "audio/webm",
     ];
+    const mimeType = supportedTypes.find((type) => MediaRecorder.isTypeSupported(type));
+
     try {
       const options = {
         mimeType: mimeType || undefined,
-        videoBitsPerSecond: 2500000, // 2.5 Mbps for high quality raw-like video
-        audioBitsPerSecond: 128000,  // 128 kbps for clear audio
+        videoBitsPerSecond: 2500000,
+        audioBitsPerSecond: 128000,
       };
       const recorder = new MediaRecorder(recordingStream, options);
 
@@ -492,19 +494,22 @@
     // Always track active streams
     let alreadyTracked = false;
     for (const item of state.activeStreams) {
-        if (item.stream === stream) {
-            alreadyTracked = true;
-            break;
-        }
+      if (item.stream.id === stream.id) {
+        alreadyTracked = true;
+        break;
+      }
     }
     if (!alreadyTracked) {
-        state.activeStreams.add({ stream, constraints, isRemote });
+      state.activeStreams.add({ stream, constraints, isRemote });
     }
 
     // Only proceed if conditions are met
     if (!captureFlags.consentGranted || !captureFlags.studentLabel) {
+        console.log(`[HOOK] Capture deferred: consent=${captureFlags.consentGranted}, label="${captureFlags.studentLabel}"`);
         return;
     }
+
+    console.log(`[HOOK] Starting inspection for stream: ${stream.id} (Label: ${captureFlags.studentLabel})`);
 
     state.inspectedStreams.add(stream);
     const streamId = isRemote ? `remote-${++state.remoteTrackCount}` : `local-${++state.streamCount}`;

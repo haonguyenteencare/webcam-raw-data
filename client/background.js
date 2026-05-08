@@ -7,20 +7,27 @@ const DEFAULT_SETTINGS = {
 // In-memory cache for speed, but synced with storage
 let sessions = new Map();
 let pendingUploads = new Map();
-let isInitializing = false;
+let initializationPromise = null;
 
 const loadState = async () => {
-  if (isInitializing) return;
-  isInitializing = true;
-  try {
-    const { persistentSessions = {}, persistentPending = {} } = await chrome.storage.session.get(["persistentSessions", "persistentPending"]);
-    sessions = new Map(Object.entries(persistentSessions).map(([k, v]) => [Number(k), v]));
-    pendingUploads = new Map(Object.entries(persistentPending).map(([k, v]) => [Number(k), v]));
-  } catch (e) {
-    console.error("Failed to load state:", e);
-  } finally {
-    isInitializing = false;
+  if (initializationPromise) {
+    return initializationPromise;
   }
+
+  initializationPromise = (async () => {
+    try {
+      const { persistentSessions = {}, persistentPending = {} } = await chrome.storage.session.get([
+        "persistentSessions",
+        "persistentPending",
+      ]);
+      sessions = new Map(Object.entries(persistentSessions).map(([k, v]) => [Number(k), v]));
+      pendingUploads = new Map(Object.entries(persistentPending).map(([k, v]) => [Number(k), v]));
+    } catch (e) {
+      console.error("Failed to load state:", e);
+    }
+  })();
+
+  return initializationPromise;
 };
 
 const saveState = async () => {
@@ -128,6 +135,10 @@ const getSession = async (tabId, pageUrl) => {
     const settings = await getStoredSettings();
     const sessionId = makeSessionId(tabId);
     const meetingId = parseMeetingId(pageUrl);
+
+    // Clear local storage when a brand new session starts for this tab
+    await chrome.storage.local.set({ events: [], sessionSummary: null });
+    console.log(`[SESSION] New session starting for tab ${tabId}, cleared local storage.`);
 
     sessions.set(tabId, {
       id: sessionId,
@@ -251,10 +262,10 @@ const downloadJson = async (session) => {
   return { ok: true, filename: `${session.id}.json`, eventCount: session.events.length };
 };
 
-const uploadBatch = async (tabId) => {
+const uploadBatch = async (tabId, forceInit = false) => {
   const pending = pendingUploads.get(tabId) || [];
 
-  if (pending.length === 0) {
+  if (pending.length === 0 && !forceInit) {
     return;
   }
 
@@ -269,33 +280,54 @@ const uploadBatch = async (tabId) => {
   session.upload.lastAttemptAt = new Date().toISOString();
 
   try {
+    const payload = {
+      meetingId: session.meetingId,
+      studentId: session.studentId,
+      studentLabel: session.studentLabel,
+      sessionId: session.sessionId,
+      pageUrl: session.pageUrl,
+      userAgent: navigator.userAgent,
+      events: batch.map(getPayloadForUpload),
+    };
+
+    console.log(`[UPLOAD] Sending request to ${API_BASE_URL}/api/capture/batch`, {
+        meetingId: payload.meetingId,
+        studentLabel: payload.studentLabel,
+        eventCount: payload.events.length,
+        forceInit
+    });
+
+    console.log(`[UPLOAD] Fetching: ${API_BASE_URL}/api/capture/batch with ${payload.events.length} events`);
     const response = await fetch(`${API_BASE_URL}/api/capture/batch`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        meetingId: session.meetingId,
-        studentId: session.studentId,
-        studentLabel: session.studentLabel,
-        sessionId: session.sessionId,
-        pageUrl: session.pageUrl,
-        userAgent: navigator.userAgent,
-        events: batch.map(getPayloadForUpload),
-      }),
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
-      throw new Error(`API responded ${response.status}`);
+      const errorText = await response.text();
+      console.error(`[UPLOAD] Server returned error: ${response.status}`, errorText);
+      throw new Error(`Server error ${response.status}: ${errorText}`);
     }
 
     const result = await response.json();
+    console.log(`[UPLOAD] Success! Saved ${result.savedEventCount} events. Path: ${result.sessionPath}`);
 
     session.upload.lastSuccessAt = new Date().toISOString();
     session.upload.lastError = null;
     session.upload.uploadedEventCount += result.savedEventCount || batch.length;
     session.upload.nextAttemptDelay = 0;
     await saveState();
+
+    // Notify the tab about successful upload
+    chrome.tabs.sendMessage(tabId, {
+        type: "upload-success",
+        count: batch.length,
+        sessionId: session.sessionId
+    }).catch(() => {}); // Ignore errors if tab is closed
+
     console.log(`Successfully uploaded batch of ${batch.length} events for session ${session.sessionId}`);
   } catch (error) {
     console.error(`Upload failed: ${error.message}. Re-queueing batch.`);
@@ -338,18 +370,44 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === "raw-data-event" && sender.tab?.id !== undefined) {
-    if (!RECORDED_TYPES.has(message.event.type)) {
-      console.warn(`Ignoring event type: ${message.event.type}`);
-      sendResponse({ ok: true, recorded: false });
-      return false;
+// Reliably detect when a Meet tab is closed to clear data
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await loadState();
+  if (sessions.has(tabId)) {
+    console.log(`[TAB] Tab ${tabId} closed. Cleaning up session data...`);
+    const session = sessions.get(tabId);
+    
+    // Final attempt to upload if there's unsent data
+    if (session.events.length > 0) {
+      await uploadBatch(tabId).catch(() => {});
     }
 
-    console.log(`Recording event: ${message.event.type} for tab ${sender.tab.id}`);
+    sessions.delete(tabId);
+    pendingUploads.delete(tabId);
+    
+    // Reset local storage for the popup and turn OFF the capture switch
+    await chrome.storage.local.set({ 
+      events: [], 
+      sessionSummary: null,
+      consentGranted: false 
+    });
+    await saveState();
+    console.log(`[TAB] Session data and Consent for tab ${tabId} cleared successfully.`);
+  }
+});
 
-    getSession(sender.tab.id, message.event.pageUrl)
-      .then((session) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Wrap in an async IIFE to allow await while returning true synchronously
+  (async () => {
+    try {
+      if (message?.type === "raw-data-event" && sender.tab?.id !== undefined) {
+        if (!RECORDED_TYPES.has(message.event.type)) {
+          console.warn(`[BG] Ignoring event type: ${message.event.type}`);
+          sendResponse({ ok: true, recorded: false });
+          return;
+        }
+
+        const session = await getSession(sender.tab.id, message.event.pageUrl);
         const event = {
           ...message.event,
           meetingId: session.meetingId,
@@ -359,8 +417,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
 
         session.events.push(getPayloadForExport(event));
-        refreshSessionStats(session, event);
-        queueUpload(sender.tab.id, event);
+        await refreshSessionStats(session, event);
+        await queueUpload(sender.tab.id, event);
+
         sendResponse({
           ok: true,
           recorded: true,
@@ -373,58 +432,109 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           studentLabel: session.studentLabel,
           sessionId: session.sessionId,
         });
-      })
-      .catch((error) => sendResponse({ ok: false, reason: error.message }));
-
-    return true;
-  }
-
-  if (message?.type === "export-session") {
-    const session = sessions.get(message.tabId);
-
-    downloadJson(session)
-      .then(sendResponse)
-      .catch((error) => sendResponse({ ok: false, reason: error.message }));
-
-    return true;
-  }
-
-  if (message?.type === "flush-upload") {
-    uploadBatch(message.tabId)
-      .then(() => sendResponse({ ok: true }))
-      .catch((error) => sendResponse({ ok: false, reason: error.message }));
-
-    return true;
-  }
-
-  if (message?.type === "session-ended" && sender.tab?.id !== undefined) {
-    const session = sessions.get(sender.tab.id);
-
-    if (session && session.events.length > 0) {
-      session.endedAt = new Date().toISOString();
-      uploadBatch(sender.tab.id).catch(() => {});
-    }
-
-    sendResponse({ ok: true });
-    return false;
-  }
-
-  if (message?.type === "save-identity") {
-    const nextStudentLabel = String(message.studentLabel || "").trim();
-
-    setStoredSettings({ studentLabel: nextStudentLabel })
-      .then(() => {
-        for (const session of sessions.values()) {
-          session.studentLabel = nextStudentLabel;
-          session.identity.studentLabel = nextStudentLabel;
+      } else if (message?.type === "export-session") {
+        const session = sessions.get(message.tabId);
+        if (!session) {
+          sendResponse({ ok: false, reason: "Không tìm thấy dữ liệu phiên cho tab này." });
+        } else {
+          const result = await downloadJson(session);
+          sendResponse(result);
+        }
+      } else if (message?.type === "flush-upload") {
+        await uploadBatch(message.tabId);
+        const pending = pendingUploads.get(message.tabId) || [];
+        sendResponse({ ok: true, pendingCount: pending.length });
+      } else if (message?.type === "clear-session") {
+        const tabId = message.tabId;
+        if (sessions.has(tabId)) {
+          const session = sessions.get(tabId);
+          session.events = [];
+          session.stats = { eventCount: 0, estimatedStoredBytes: 0, estimatedRawBytes: 0 };
+          if (pendingUploads.has(tabId)) {
+            pendingUploads.set(tabId, []);
+          }
+          await saveState();
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, reason: "Session not found" });
+        }
+      } else if (message?.type === "session-ended" && sender.tab?.id !== undefined) {
+        const tabId = sender.tab.id;
+        const session = sessions.get(tabId);
+        
+        if (session && session.events.length > 0) {
+          console.log(`[SESSION] Session ended for tab ${tabId}. Performing final upload...`);
+          session.endedAt = new Date().toISOString();
+          await uploadBatch(tabId);
         }
 
-        sendResponse({ ok: true, studentLabel: nextStudentLabel });
-      })
-      .catch((error) => sendResponse({ ok: false, reason: error.message }));
+        // Clear session from memory and storage
+        sessions.delete(tabId);
+        pendingUploads.delete(tabId);
+        // Clear local storage so popup doesn't show old data and turn OFF the switch
+        await chrome.storage.local.set({ 
+          events: [], 
+          sessionSummary: null,
+          consentGranted: false 
+        });
+        
+        await saveState();
+        console.log(`[SESSION] Data and Consent cleared for ended session in tab ${tabId}`);
+        
+        sendResponse({ ok: true });
+      } else if (message?.type === "save-identity") {
+        const nextStudentLabel = String(message.studentLabel || "").trim();
 
-    return true;
-  }
+        const tab = await chrome.tabs.get(message.tabId).catch(() => null);
+        if (tab?.url) {
+          await getSession(message.tabId, tab.url);
+        }
 
-  return false;
+        await setStoredSettings({ studentLabel: nextStudentLabel });
+
+        let updatedCount = 0;
+        for (const session of sessions.values()) {
+          session.studentLabel = nextStudentLabel;
+          if (!session.identity) {
+            session.identity = {};
+          }
+          session.identity.studentLabel = nextStudentLabel;
+          updatedCount++;
+        }
+
+        if (message.tabId && pendingUploads.has(message.tabId)) {
+          const pending = pendingUploads.get(message.tabId);
+          for (const event of pending) {
+            event.studentLabel = nextStudentLabel;
+          }
+        }
+
+        if (updatedCount > 0) {
+          await saveState();
+        }
+
+        if (message.tabId) {
+          // Trigger upload in background without awaiting, to prevent popup timeout
+          uploadBatch(message.tabId, true).catch(err => console.error("[BG] Initial upload failed:", err));
+        }
+
+        sendResponse({ ok: true, studentLabel: nextStudentLabel, updatedSessions: updatedCount });
+      } else if (message?.type === "check-server") {
+        try {
+          const res = await fetch(`${API_BASE_URL}/health`);
+          const data = await res.json();
+          sendResponse({ ok: true, connected: true, data });
+        } catch (err) {
+          sendResponse({ ok: true, connected: false, reason: err.message });
+        }
+      } else {
+        sendResponse({ ok: false, reason: "Unknown message type" });
+      }
+    } catch (error) {
+      console.error("[BG] Message handling error:", error);
+      sendResponse({ ok: false, reason: error.message });
+    }
+  })();
+
+  return true; // Keep message channel open for async response
 });
