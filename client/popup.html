@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Meet Raw Data PoC</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header>
+      <h1>Meet Raw Data PoC</h1>
+      <div class="actions">
+        <button id="save-identity" type="button">Save identity</button>
+        <button id="viewer" type="button">Viewer</button>
+        <button id="export" type="button">Export</button>
+        <button id="clear" type="button">Clear</button>
+      </div>
+    </header>
+
+    <section id="consent" class="panel consent-panel">
+      <p class="consent-note">
+        Camera and microphone data is sensitive. Enable capture only for research you are authorized to run. Research raw mode can produce very large files.
+      </p>
+      <label class="checkbox-row">
+        <input id="consent-granted" type="checkbox">
+        <span>I consent to local capture on this device (required)</span>
+      </label>
+      <label class="checkbox-row">
+        <input id="research-raw-mode" type="checkbox" disabled>
+        <span>Research-only raw mode (sparse full RGBA + PCM in exports)</span>
+      </label>
+    </section>
+
+    <section id="identity" class="panel">
+      <label>
+        Student label
+        <input id="student-label" type="text" placeholder="e.g. lop-10A / minh-anh">
+      </label>
+    </section>
+
+    <section id="summary" class="summary">Waiting for Google Meet media...</section>
+    <section id="status">Waiting for Google Meet media...</section>
+    <main id="events"></main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

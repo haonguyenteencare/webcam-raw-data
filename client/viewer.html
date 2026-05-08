@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Meet Raw Data Viewer</title>
+    <link rel="stylesheet" href="viewer.css">
+  </head>
+  <body>
+    <header>
+      <h1>Meet Raw Data Viewer</h1>
+      <input id="file" type="file" accept="application/json,.json">
+    </header>
+
+    <section id="summary">Choose an exported session JSON file.</section>
+    <main>
+      <section>
+        <h2>Video Frames</h2>
+        <div id="frames"></div>
+      </section>
+      <section>
+        <h2>Audio Chunks</h2>
+        <div id="audio"></div>
+      </section>
+      <section class="wide">
+        <h2>WebM Recordings</h2>
+        <div id="recordings"></div>
+      </section>
+    </main>
+
+    <script src="viewer.js"></script>
+  </body>
+</html>
