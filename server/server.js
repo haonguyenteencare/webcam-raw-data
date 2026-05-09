@@ -1,6 +1,6 @@
 import cors from "cors";
 import express from "express";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -139,6 +139,59 @@ const saveEvent = async (sessionDir, event, index) => {
   };
 
   try {
+    if (event.type === "video-batch") {
+      const frameDir = path.join(sessionDir, "frames");
+
+      await mkdir(frameDir, { recursive: true });
+
+      const frames = payload.frames || [];
+      const savedFrames = [];
+
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        const frameTimestamp = Number(frame.at || Date.now());
+        const frameBaseName = `${frameTimestamp}-${streamId}-${String(index).padStart(4, "0")}-f${String(i).padStart(3, "0")}`;
+        
+        const savedFrame = {
+          at: frameTimestamp,
+          files: {},
+          metadata: {
+            width: frame.displayWidth,
+            height: frame.displayHeight,
+            allocationSize: frame.allocationSize,
+            checksum: frame.checksum,
+            sourceFormat: frame.sourceFormat,
+            copiedFormat: frame.copiedFormat,
+            rawSource: frame.rawSource,
+            frameCount: frame.frameCount,
+          },
+        };
+
+        if (frame.thumbnailDataUrl) {
+          const { buffer } = parseDataUrl(frame.thumbnailDataUrl);
+          const thumbnailPath = path.join(frameDir, `${frameBaseName}.jpg`);
+
+          await writeFile(thumbnailPath, buffer);
+          savedFrame.files.thumbnail = path.relative(sessionDir, thumbnailPath);
+        }
+
+        if (frame.rgbaDataUrl) {
+          const { buffer } = parseDataUrl(frame.rgbaDataUrl);
+          const rawPath = path.join(frameDir, `${frameBaseName}.rgba`);
+
+          await writeFile(rawPath, buffer);
+          savedFrame.files.rgba = path.relative(sessionDir, rawPath);
+          savedFrame.metadata.rawByteSize = buffer.byteLength;
+        }
+
+        savedFrames.push(savedFrame);
+      }
+
+      saved.metadata.frames = savedFrames;
+      saved.metadata.frameCount = savedFrames.length;
+      return saved;
+    }
+
     if (event.type === "video-frame") {
       const frameDir = path.join(sessionDir, "frames");
 
@@ -177,58 +230,50 @@ const saveEvent = async (sessionDir, event, index) => {
       return saved;
     }
 
-    if (event.type === "audio-recording") {
-      const audioDir = path.join(sessionDir, "audio");
-
-      await mkdir(audioDir, { recursive: true });
-
-      const samplesPath = path.join(audioDir, `${baseName}.json`);
-      const float32Path = path.join(audioDir, `${baseName}.f32`);
-
-      await writeJson(samplesPath, {
-        sampleRate: payload.sampleRate,
-        channels: payload.channels,
-        sampleCount: payload.sampleCount,
-        samples: payload.samples || [],
-      });
-      await writeFile(float32Path, decodeNumberArray(payload.samples, 4));
-
-      saved.files.samples = path.relative(sessionDir, samplesPath);
-      saved.files.float32 = path.relative(sessionDir, float32Path);
-      saved.metadata = {
-        sampleRate: payload.sampleRate,
-        channels: payload.channels,
-        sampleCount: payload.sampleCount,
-        track: payload.track,
-      };
-      console.log(`[SAVE] Saved audio recording: ${float32Path}`);
-      return saved;
-    }
-
     if (event.type === "media-recording") {
-      const recordingDir = path.join(sessionDir, "recordings");
-
+      const recordingDir = path.join(sessionDir, "recordings", streamId);
       await mkdir(recordingDir, { recursive: true });
 
       if (payload.dataUrl) {
         const { buffer, mimeType } = parseDataUrl(payload.dataUrl);
-        const extension = mimeType.includes("webm") ? "webm" : "bin";
-        const recordingPath = path.join(recordingDir, `${baseName}.${extension}`);
+        const ext = mimeType.split("/")[1]?.split(";")[0] || "webm";
+        const chunkIndex = payload.chunkIndex !== undefined ? payload.chunkIndex : index;
+        const filePath = path.join(recordingDir, `chunk-${String(chunkIndex).padStart(5, "0")}.${ext}`);
 
-        await writeFile(recordingPath, buffer);
-        saved.files.recording = path.relative(sessionDir, recordingPath);
-        saved.metadata.byteSize = buffer.byteLength;
-        console.log(`[SAVE] Saved media recording: ${recordingPath} (${buffer.byteLength} bytes)`);
+        await writeFile(filePath, buffer);
+        saved.files.video = path.relative(sessionDir, filePath);
+        saved.metadata.chunkIndex = chunkIndex;
+        saved.metadata.mimeType = mimeType;
+        saved.metadata.size = buffer.byteLength;
+      }
+      return saved;
+    }
+
+    if (event.type === "audio-recording") {
+      const recordingDir = path.join(sessionDir, "recordings", streamId);
+      await mkdir(recordingDir, { recursive: true });
+
+      const chunkIndex = payload.chunkIndex !== undefined ? payload.chunkIndex : index;
+      const baseName = `chunk-${String(chunkIndex).padStart(5, "0")}`;
+
+      if (payload.samples && Array.isArray(payload.samples)) {
+        const buffer = Buffer.from(new Float32Array(payload.samples).buffer);
+        const filePath = path.join(recordingDir, `${baseName}.float32`);
+
+        await writeFile(filePath, buffer);
+        saved.files.samples = path.relative(sessionDir, filePath);
+        saved.metadata.rawByteSize = buffer.byteLength;
       }
 
-      saved.metadata = {
-        ...saved.metadata,
-        mimeType: payload.mimeType,
-        size: payload.size,
-        hasAudio: payload.hasAudio,
-        hasVideo: payload.hasVideo,
-      };
+      saved.metadata.chunkIndex = chunkIndex;
+      saved.metadata.sampleRate = payload.sampleRate;
+      saved.metadata.channels = payload.channels;
+      saved.metadata.sampleCount = payload.sampleCount;
       return saved;
+    }
+
+    if (event.type === "session-ended") {
+      console.log(`[SESSION] Meeting ended: Session ${payload.sessionId} (Student: ${payload.studentLabel})`);
     }
 
     const eventDir = path.join(sessionDir, "events");
@@ -274,6 +319,47 @@ const findManifests = async (directory) => {
   return manifests;
 };
 
+/**
+ * Tìm và di chuyển thư mục session nếu nó đã tồn tại ở một vị trí khác (thường là unknown-meeting)
+ */
+async function findAndMoveSessionDir(sessionId, targetParentPath, sessionIdParam) {
+  const targetDir = path.join(targetParentPath, sessionIdParam);
+  
+  // Nếu đã ở đúng vị trí rồi thì thôi
+  try {
+    await access(targetDir);
+    return targetDir;
+  } catch (e) {
+    // Chưa ở đúng vị trí, đi tìm
+  }
+
+  try {
+    const parents = await readdir(capturesRoot);
+    for (const parent of parents) {
+      const parentPath = path.join(capturesRoot, parent);
+      const parentStat = await stat(parentPath);
+      
+      if (parentStat.isDirectory()) {
+        const potentialDir = path.join(parentPath, sessionIdParam);
+        try {
+          await access(potentialDir);
+          // Tìm thấy ở chỗ khác! Di chuyển nó về chỗ mới
+          console.log(`[FS] Moving session ${sessionIdParam} from ${parent} to new location...`);
+          await mkdir(targetParentPath, { recursive: true });
+          await rename(potentialDir, targetDir);
+          return targetDir;
+        } catch (err) {
+          // Không có ở đây
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[FS] Error while searching for existing session:", err);
+  }
+
+  return targetDir;
+}
+
 app.get("/health", (_request, response) => {
   console.log(`[HTTP] GET /health`);
   response.json({ ok: true, capturesRoot });
@@ -290,9 +376,11 @@ app.post("/api/capture/batch", async (request, response, next) => {
     
     console.log(`[BATCH] Receiving ${events.length} events for session: ${sessionId} (Student: ${studentLabel})`);
 
-    // New structure: captures/[meetingId]_[studentId]_[studentLabel]/[sessionId]
     const studentFolderName = `${meetingId}_${studentId}_${studentLabel}`;
-    const sessionDir = path.resolve(capturesRoot, studentFolderName, sessionId);
+    const targetParentPath = path.resolve(capturesRoot, studentFolderName);
+    
+    // Tìm và di chuyển thư mục phiên cũ nếu cần
+    const sessionDir = await findAndMoveSessionDir(sessionId, targetParentPath, sessionId);
     console.log(`[FS] Absolute session path: ${sessionDir}`);
 
     console.log(`[FS] Ensuring directory exists...`);

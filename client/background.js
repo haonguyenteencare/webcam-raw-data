@@ -45,6 +45,7 @@ const RECORDED_TYPES = new Set([
   "get-user-media-called",
   "stream-captured",
   "video-frame",
+  "video-batch",
   "audio-samples",
   "audio-recording",
   "media-recorder-started",
@@ -304,6 +305,7 @@ const uploadBatch = async (tabId, forceInit = false) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
+      keepalive: true,
     });
 
     if (!response.ok) {
@@ -408,6 +410,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         const session = await getSession(sender.tab.id, message.event.pageUrl);
+
+        if (message.event.type === "video-batch") {
+            console.log(`[BG] Received video-batch from tab ${sender.tab.id} with ${message.event.payload.frames?.length || 0} frames.`);
+        }
+
         const event = {
           ...message.event,
           meetingId: session.meetingId,
@@ -462,8 +469,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const tabId = sender.tab.id;
         const session = sessions.get(tabId);
         
-        if (session && session.events.length > 0) {
-          console.log(`[SESSION] Session ended for tab ${tabId}. Performing final upload...`);
+        if (session) {
+          console.log(`[SESSION] Session ended for tab ${tabId}. Sending end event...`);
+          
+          // Tạo sự kiện kết thúc để server có thể log
+          const endEvent = {
+            type: "session-ended",
+            at: Date.now(),
+            pageUrl: session.pageUrl,
+            payload: {
+                sessionId: session.sessionId,
+                studentLabel: session.studentLabel,
+                meetingId: session.meetingId
+            }
+          };
+          
+          session.events.push(endEvent);
+          await queueUpload(tabId, endEvent);
+
           session.endedAt = new Date().toISOString();
           await uploadBatch(tabId);
         }
@@ -521,7 +544,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: true, studentLabel: nextStudentLabel, updatedSessions: updatedCount });
       } else if (message?.type === "check-server") {
         try {
-          const res = await fetch(`${API_BASE_URL}/health`);
+          const res = await fetch(`${API_BASE_URL}/health`, { keepalive: true });
           const data = await res.json();
           sendResponse({ ok: true, connected: true, data });
         } catch (err) {

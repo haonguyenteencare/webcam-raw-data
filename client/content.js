@@ -1,6 +1,16 @@
 (() => {
   const MAX_EVENTS = 80;
 
+  let meetingReady = false;
+  let pendingRecord = false;
+
+  const inMeetingUrl = () => /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(location.href);
+
+  const checkMeetingReady = () => {
+    const micButton = document.querySelector('[data-is-muted], [aria-label*="microphone"], [aria-label*="micro"]');
+    return inMeetingUrl() && !!micButton;
+  };
+
   const broadcastCaptureSettings = async () => {
     const { consentGranted = false, researchRawMode = false, studentLabel = "" } = await chrome.storage.local.get({
       consentGranted: false,
@@ -8,18 +18,69 @@
       studentLabel: "",
     });
 
+    const { recordingState } = await chrome.storage.session.get("recordingState");
+    const isReady = checkMeetingReady();
+
+    if (consentGranted && !isReady) {
+      if (!pendingRecord) {
+        pendingRecord = true;
+        showToast("⏳ Sẽ tự động ghi hình khi vào cuộc họp...");
+      }
+    }
+
+    if (consentGranted && isReady) {
+      if (pendingRecord) {
+        pendingRecord = false;
+        showToast("🔴 Đang bắt đầu ghi hình cuộc họp...");
+      }
+      meetingReady = true;
+    }
+
     window.postMessage(
       {
         source: "meet-raw-data-poc-settings",
         consentGranted,
         researchRawMode,
         studentLabel: String(studentLabel || "").trim(),
+        lastIndices: recordingState?.lastIndices || {},
       },
       "*",
     );
   };
 
-  void broadcastCaptureSettings();
+  const checkAndResumeRecording = async () => {
+    const { recordingState } = await chrome.storage.session.get("recordingState");
+    
+    if (recordingState?.wasRecording) {
+      const sameMeeting = location.href.includes(recordingState.meetingCode);
+      if (sameMeeting && inMeetingUrl()) {
+        console.log("[CONTENT] Resuming session after reload...");
+        showToast("🔄 Đang tiếp tục ghi hình sau khi tải lại...");
+        await chrome.storage.local.set({ consentGranted: true });
+        // Giữ lại recordingState để broadcastCaptureSettings có thể dùng lastIndices
+      } else {
+        await chrome.storage.session.remove("recordingState");
+      }
+    }
+  };
+
+  const startReadyObserver = () => {
+    const observer = new MutationObserver(() => {
+      const isReady = checkMeetingReady();
+      if (isReady && !meetingReady) {
+        console.log("[CONTENT] Observer detected meeting is ready.");
+        void broadcastCaptureSettings();
+      } else if (!isReady && meetingReady) {
+        meetingReady = false;
+      }
+    });
+    observer.observe(document.body, { subtree: true, childList: true });
+  };
+
+  void checkAndResumeRecording().then(() => {
+    void broadcastCaptureSettings();
+    startReadyObserver();
+  });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local" && (changes.consentGranted || changes.researchRawMode || changes.studentLabel)) {
@@ -30,6 +91,30 @@
 
   const updateStorage = async (event) => {
     const response = await chrome.runtime.sendMessage({ type: "raw-data-event", event });
+    
+    // Lưu trạng thái để resume nếu F5
+    const { recordingState } = await chrome.storage.session.get("recordingState");
+    let nextState = recordingState || null;
+
+    if (event.type === "stream-captured") {
+        nextState = {
+            wasRecording: true,
+            meetingCode: response?.meetingId || "unknown",
+            at: Date.now(),
+            lastIndices: (recordingState?.lastIndices || {})
+        };
+    }
+
+    if (nextState && (event.type === "media-recording" || event.type === "audio-recording")) {
+        nextState.lastIndices = nextState.lastIndices || {};
+        if (event.payload.streamId && event.payload.chunkIndex !== undefined) {
+            nextState.lastIndices[event.payload.streamId] = event.payload.chunkIndex;
+        }
+    }
+
+    if (nextState) {
+        await chrome.storage.session.set({ recordingState: nextState });
+    }
 
     if (event.type === "media-recording" || event.type === "audio-recording") {
       await chrome.storage.local.set({
@@ -152,7 +237,28 @@
     }).catch(() => {});
   });
 
+  // Theo dõi kết thúc cuộc họp qua URL
+  let previousUrl = location.href;
+  const urlObserver = new MutationObserver(() => {
+    if (location.href !== previousUrl) {
+      const oldUrl = previousUrl;
+      previousUrl = location.href;
+      
+      const wasInMeeting = /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(oldUrl);
+      const inMeeting = /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(location.href);
+      
+      if (wasInMeeting && !inMeeting) {
+        console.log("[CONTENT] Meeting ended (URL change). Stopping recording...");
+        chrome.runtime.sendMessage({ type: "session-ended" }).catch(() => {});
+        window.postMessage({ source: "meet-raw-data-poc-stop" }, "*");
+      }
+    }
+  });
+
+  urlObserver.observe(document, { subtree: true, childList: true });
+
   window.addEventListener("pagehide", () => {
-    chrome.runtime.sendMessage({ type: "session-ended" }).catch(() => {});
+    // Chỉ dừng hook ở mức trang, không kết thúc session ở background để F5 có thể resume
+    window.postMessage({ source: "meet-raw-data-poc-stop" }, "*");
   });
 })();
