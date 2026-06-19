@@ -13,7 +13,23 @@
     remoteTrackCount: 0,
     activeStreams: new Set(), // Track streams that are currently live
     inspectedStreams: new Set(), // Track streams we have already started inspecting
+    activeFlushers: new Set(),
+    activeRecorders: new Set(),
   };
+
+  window.addEventListener("beforeunload", () => {
+    console.log("[HOOK] Page unloading... Flushing all active readers and recorders.");
+    for (const flush of state.activeFlushers) {
+      try { flush(); } catch (e) {}
+    }
+    for (const recorder of state.activeRecorders) {
+      try {
+        if (recorder.state === "recording") {
+          recorder.requestData();
+        }
+      } catch (e) {}
+    }
+  });
 
   const captureFlags = {
     consentGranted: false,
@@ -38,25 +54,34 @@
     firstSettingsWaiters.length = 0;
   };
 
+  let initialIndices = {};
+
   window.addEventListener("message", (event) => {
     if (event.source !== window) {
       return;
     }
 
-    if (!event.data || event.data.source !== "meet-raw-data-poc-settings") {
+    if (!event.data) {
       return;
     }
 
-    captureFlags.consentGranted = Boolean(event.data.consentGranted);
-    captureFlags.researchRawMode = Boolean(event.data.researchRawMode);
-    captureFlags.studentLabel = String(event.data.studentLabel || "").trim();
-    
-    // Re-check all active streams whenever settings change
-    for (const { stream, constraints, isRemote } of state.activeStreams) {
-      inspectStream(stream, constraints, isRemote);
-    }
+    if (event.data.source === "meet-raw-data-poc-settings") {
+      captureFlags.consentGranted = Boolean(event.data.consentGranted);
+      captureFlags.researchRawMode = Boolean(event.data.researchRawMode);
+      captureFlags.studentLabel = String(event.data.studentLabel || "").trim();
+      initialIndices = event.data.lastIndices || {};
+      
+      // Re-check all active streams whenever settings change
+      for (const { stream, constraints, isRemote } of state.activeStreams) {
+        inspectStream(stream, constraints, isRemote);
+      }
 
-    resolveFirstSettings();
+      resolveFirstSettings();
+    } else if (event.data.source === "meet-raw-data-poc-stop") {
+      console.log("[HOOK] Stop signal received. Revoking consent and cleaning up...");
+      captureFlags.consentGranted = false;
+      // Trình xử lý trong các hàm read sẽ tự động nhận biết và dọn dẹp
+    }
   });
 
   window.setTimeout(() => {
@@ -154,13 +179,18 @@
       "audio/webm;codecs=opus",
       "audio/webm",
     ];
+    const mimeType = supportedTypes.find((type) => MediaRecorder.isTypeSupported(type));
+
     try {
       const options = {
         mimeType: mimeType || undefined,
-        videoBitsPerSecond: 2500000, // 2.5 Mbps for high quality raw-like video
-        audioBitsPerSecond: 128000,  // 128 kbps for clear audio
+        videoBitsPerSecond: 2500000,
+        audioBitsPerSecond: 128000,
       };
       const recorder = new MediaRecorder(recordingStream, options);
+      state.activeRecorders.add(recorder);
+
+      let chunkIndex = (initialIndices[streamId] || -1) + 1;
 
       recorder.addEventListener("dataavailable", async (event) => {
         if (!event.data || event.data.size === 0) {
@@ -170,6 +200,7 @@
         try {
           post("media-recording", {
             streamId,
+            chunkIndex: chunkIndex++,
             mimeType: recorder.mimeType,
             size: event.data.size,
             hasAudio: recordingStream.getAudioTracks().length > 0,
@@ -186,6 +217,14 @@
 
       recorder.start(5000);
 
+      const checkConsentInterval = window.setInterval(() => {
+        if (!captureFlags.consentGranted && recorder.state !== "inactive") {
+            console.log("[HOOK] Stopping MediaRecorder due to consent revocation");
+            recorder.stop();
+            window.clearInterval(checkConsentInterval);
+        }
+      }, 2000);
+
       for (const track of stream.getTracks()) {
         track.addEventListener(
           "ended",
@@ -197,6 +236,8 @@
             for (const clonedTrack of clonedTracks) {
               clonedTrack.stop();
             }
+            state.activeRecorders.delete(recorder);
+            window.clearInterval(checkConsentInterval);
           },
           { once: true },
         );
@@ -216,7 +257,7 @@
     }
   };
 
-  const readVideoFrames = async (track, streamId) => {
+  const readVideoFrames = async (track, streamId, parentStream) => {
     if (!("MediaStreamTrackProcessor" in window) || !("VideoFrame" in window)) {
       post("video-unsupported", {
         track: summarizeTrack(track),
@@ -231,16 +272,37 @@
     let lastSentAt = 0;
     let lastRawSentAt = 0;
     let frameCount = 0;
+    let frameBatch = [];
 
     state.tracks.set(sampleTrack.id, sampleTrack);
+
+    const flushBatch = () => {
+      if (frameBatch.length > 0) {
+        console.log(`[HOOK] Flushing video batch with ${frameBatch.length} frames for stream ${streamId}`);
+        post("video-batch", {
+          streamId,
+          track: summarizeTrack(track),
+          frames: frameBatch,
+        });
+        frameBatch = [];
+      }
+    };
+
+    state.activeFlushers.add(flushBatch);
 
     track.addEventListener("ended", () => {
       sampleTrack.stop();
       reader.cancel().catch(() => {});
-    });
+      flushBatch();
+    }, { once: true });
 
     try {
       while (sampleTrack.readyState === "live") {
+        if (!captureFlags.consentGranted) {
+          console.log("[HOOK] Video capture stopped: Consent revoked");
+          break;
+        }
+
         const { done, value: frame } = await reader.read();
 
         if (done || !frame) {
@@ -250,6 +312,7 @@
         frameCount += 1;
         const now = performance.now();
 
+        // Quay lại tần suất 1 giây mỗi hình, nhưng gộp lại gửi sau mỗi 10 hình
         if (now - lastSentAt >= 1000) {
           lastSentAt = now;
 
@@ -263,7 +326,7 @@
               frame.displayWidth,
               frame.displayHeight,
             );
-            const includeRawFrame = now - lastRawSentAt >= 5000;
+            const includeRawFrame = now - lastRawSentAt >= 10000; // Raw frame mỗi 10 giây
 
             if (includeRawFrame) {
               lastRawSentAt = now;
@@ -276,13 +339,12 @@
               rgbaDataUrl = await rgbaBytesToDataUrl(buffer);
             }
 
-            post("video-frame", {
-              streamId,
+            frameBatch.push({
+              at: Date.now(),
               frameCount,
               rawSource: "VideoFrame.copyTo(RGBA)",
               sourceFormat: frame.format,
               copiedFormat: "RGBA",
-              track: summarizeTrack(track),
               codedWidth: frame.codedWidth,
               codedHeight: frame.codedHeight,
               displayWidth: frame.displayWidth,
@@ -299,7 +361,12 @@
               ...(rgbaDataUrl ? { rgbaDataUrl } : {}),
               layout,
             });
+
+            if (frameBatch.length >= 10) {
+              flushBatch();
+            }
           } catch (error) {
+            // Fallback sang Canvas nếu copyTo lỗi
             try {
               const bitmap = await createImageBitmap(frame);
               const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -315,7 +382,7 @@
                 bitmap.width,
                 bitmap.height,
               );
-              const includeRawFrame = now - lastRawSentAt >= 5000;
+              const includeRawFrame = now - lastRawSentAt >= 10000;
 
               if (includeRawFrame) {
                 lastRawSentAt = now;
@@ -328,14 +395,13 @@
                 rgbaDataUrl = await rgbaBytesToDataUrl(buffer);
               }
 
-              post("video-frame", {
-                streamId,
+              frameBatch.push({
+                at: Date.now(),
                 frameCount,
                 rawSource: "canvas.getImageData(RGBA)",
                 sourceFormat: frame.format,
                 copiedFormat: "RGBA",
                 copyToError: error.message,
-                track: summarizeTrack(track),
                 codedWidth: frame.codedWidth,
                 codedHeight: frame.codedHeight,
                 displayWidth: frame.displayWidth,
@@ -351,6 +417,10 @@
                 rawIncluded,
                 ...(rgbaDataUrl ? { rgbaDataUrl } : {}),
               });
+
+              if (frameBatch.length >= 10) {
+                flushBatch();
+              }
 
               bitmap.close();
             } catch (fallbackError) {
@@ -372,10 +442,44 @@
         track: summarizeTrack(track),
         message: error.message,
       });
+    } finally {
+      sampleTrack.stop();
+      reader.cancel().catch(() => {});
+      flushBatch();
+      state.activeFlushers.delete(flushBatch);
+      state.inspectedStreams.delete(parentStream);
     }
   };
 
-  const readAudioSamples = (track, streamId) => {
+  const audioProcessorCode = `
+    class AudioSampleProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this._bufferSize = 4096;
+        this._buffer = new Float32Array(this._bufferSize);
+        this._offset = 0;
+      }
+
+      process(inputs, outputs, parameters) {
+        const input = inputs[0];
+        if (input.length > 0) {
+          const samples = input[0];
+          for (let i = 0; i < samples.length; i++) {
+            this._buffer[this._offset++] = samples[i];
+            if (this._offset >= this._bufferSize) {
+              // Gửi bản sao của buffer để tránh vấn đề về luồng
+              this.port.postMessage(new Float32Array(this._buffer));
+              this._offset = 0;
+            }
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor('audio-sample-processor', AudioSampleProcessor);
+  `;
+
+  const readAudioSamples = async (track, streamId, parentStream) => {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
 
     if (!AudioContextCtor) {
@@ -389,99 +493,130 @@
     const sampleTrack = track.clone();
     const audioContext = new AudioContextCtor();
     const source = audioContext.createMediaStreamSource(new MediaStream([sampleTrack]));
-    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    
     let chunkCount = 0;
+    let audioChunkIndex = (initialIndices[streamId] || -1) + 1;
     let lastSentAt = 0;
     let recordingSamples = [];
     let recordingSampleRate = audioContext.sampleRate;
     const maxRecordingSeconds = 20;
 
-    source.connect(processor);
-    processor.connect(audioContext.destination);
+    try {
+      const blob = new Blob([audioProcessorCode], { type: "application/javascript" });
+      const moduleUrl = URL.createObjectURL(blob);
+      await audioContext.audioWorklet.addModule(moduleUrl);
+      URL.revokeObjectURL(moduleUrl);
 
-    const cleanup = () => {
-      processor.disconnect();
-      source.disconnect();
-      sampleTrack.stop();
-      audioContext.close().catch(() => {});
-    };
+      const processor = new AudioWorkletNode(audioContext, "audio-sample-processor");
 
-    track.addEventListener("ended", cleanup, { once: true });
+      source.connect(processor);
+      processor.connect(audioContext.destination);
 
-    processor.onaudioprocess = (event) => {
-      chunkCount += 1;
-      const now = performance.now();
-
-      if (now - lastSentAt < 1000) {
-        return;
-      }
-
-      lastSentAt = now;
-
-      const samples = event.inputBuffer.getChannelData(0);
-      const samplesCopy = Array.from(samples);
-      let peak = 0;
-      let sumSquares = 0;
-      const preview = [];
-
-      if (recordingSamples.length < recordingSampleRate * maxRecordingSeconds) {
-        const remaining = recordingSampleRate * maxRecordingSeconds - recordingSamples.length;
-        recordingSamples.push(...samplesCopy.slice(0, remaining));
-      }
-
-      for (let index = 0; index < samples.length; index += 1) {
-        const sample = samplesCopy[index];
-        const absolute = Math.abs(sample);
-
-        if (absolute > peak) {
-          peak = absolute;
-        }
-
-        sumSquares += sample * sample;
-
-        if (index < 128) {
-          preview.push(Number(sample.toFixed(6)));
-        }
-      }
-
-      post("audio-samples", {
-        streamId,
-        chunkCount,
-        track: summarizeTrack(track),
-        sampleRate: audioContext.sampleRate,
-        channels: event.inputBuffer.numberOfChannels,
-        sampleCount: samplesCopy.length,
-        rms: Number(Math.sqrt(sumSquares / samplesCopy.length).toFixed(6)),
-        peak: Number(peak.toFixed(6)),
-        firstSamples: preview,
-        rawIncluded: false,
-      });
-    };
-
-    window.setInterval(() => {
-      if (recordingSamples.length === 0) {
-        return;
-      }
-
-      const rawIncluded = captureFlags.researchRawMode;
-      const payload = {
-        streamId,
-        track: summarizeTrack(track),
-        sampleRate: recordingSampleRate,
-        channels: 1,
-        sampleCount: recordingSamples.length,
-        firstSamples: recordingSamples.slice(0, 128).map((sample) => Number(sample.toFixed(6))),
-        rawIncluded,
+      const cleanup = () => {
+        processor.disconnect();
+        source.disconnect();
+        sampleTrack.stop();
+        audioContext.close().catch(() => {});
+        state.inspectedStreams.delete(parentStream);
       };
 
-      if (rawIncluded) {
-        payload.samples = Array.from(recordingSamples);
-      }
+      track.addEventListener("ended", cleanup, { once: true });
 
-      post("audio-recording", payload);
+      processor.port.onmessage = (event) => {
+        if (!captureFlags.consentGranted) {
+          console.log("[HOOK] Audio capture stopped: Consent revoked");
+          cleanup();
+          return;
+        }
 
-      recordingSamples = [];
-    }, 5000);
+        const samples = event.data; // Float32Array từ processor
+        chunkCount += 1;
+        const now = performance.now();
+
+        // Thu thập mẫu cho bản ghi dài
+        if (recordingSamples.length < recordingSampleRate * maxRecordingSeconds) {
+          const remaining = recordingSampleRate * maxRecordingSeconds - recordingSamples.length;
+          recordingSamples.push(...Array.from(samples.slice(0, remaining)));
+        }
+
+        // Chỉ gửi metadata/preview mỗi 1 giây (hoặc lâu hơn để giảm tải theo yêu cầu của user)
+        if (now - lastSentAt < 2000) { // Tăng lên 2 giây để giảm số lượng bản ghi
+          return;
+        }
+
+        lastSentAt = now;
+
+        let peak = 0;
+        let sumSquares = 0;
+        const preview = [];
+
+        for (let index = 0; index < samples.length; index += 1) {
+          const sample = samples[index];
+          const absolute = Math.abs(sample);
+
+          if (absolute > peak) {
+            peak = absolute;
+          }
+
+          sumSquares += sample * sample;
+
+          if (index < 128) {
+            preview.push(Number(sample.toFixed(6)));
+          }
+        }
+
+        post("audio-samples", {
+          streamId,
+          chunkCount,
+          track: summarizeTrack(track),
+          sampleRate: audioContext.sampleRate,
+          channels: 1, // Mono từ processor
+          sampleCount: samples.length,
+          rms: Number(Math.sqrt(sumSquares / samples.length).toFixed(6)),
+          peak: Number(peak.toFixed(6)),
+          firstSamples: preview,
+          rawIncluded: false,
+        });
+      };
+
+      const recordingInterval = window.setInterval(() => {
+        if (!captureFlags.consentGranted) {
+           window.clearInterval(recordingInterval);
+           return;
+        }
+
+        if (recordingSamples.length === 0) {
+          return;
+        }
+
+        const rawIncluded = captureFlags.researchRawMode;
+        const payload = {
+          streamId,
+          chunkIndex: audioChunkIndex++,
+          track: summarizeTrack(track),
+          sampleRate: recordingSampleRate,
+          channels: 1,
+          sampleCount: recordingSamples.length,
+          firstSamples: recordingSamples.slice(0, 128).map((sample) => Number(sample.toFixed(6))),
+          rawIncluded,
+        };
+
+        if (rawIncluded) {
+          payload.samples = Array.from(recordingSamples);
+        }
+
+        post("audio-recording", payload);
+
+        recordingSamples = [];
+      }, 10000); // Tăng lên 10 giây để giảm tần suất gửi bản ghi thô
+    } catch (error) {
+      console.error("[HOOK] AudioWorklet failed:", error);
+      post("audio-error", {
+        streamId,
+        message: "Failed to initialize AudioWorklet: " + error.message,
+      });
+      sampleTrack.stop();
+    }
   };
 
   const inspectStream = (stream, constraints, isRemote = false) => {
@@ -492,19 +627,22 @@
     // Always track active streams
     let alreadyTracked = false;
     for (const item of state.activeStreams) {
-        if (item.stream === stream) {
-            alreadyTracked = true;
-            break;
-        }
+      if (item.stream.id === stream.id) {
+        alreadyTracked = true;
+        break;
+      }
     }
     if (!alreadyTracked) {
-        state.activeStreams.add({ stream, constraints, isRemote });
+      state.activeStreams.add({ stream, constraints, isRemote });
     }
 
     // Only proceed if conditions are met
     if (!captureFlags.consentGranted || !captureFlags.studentLabel) {
+        console.log(`[HOOK] Capture deferred: consent=${captureFlags.consentGranted}, label="${captureFlags.studentLabel}"`);
         return;
     }
+
+    console.log(`[HOOK] Starting inspection for stream: ${stream.id} (Label: ${captureFlags.studentLabel})`);
 
     state.inspectedStreams.add(stream);
     const streamId = isRemote ? `remote-${++state.remoteTrackCount}` : `local-${++state.streamCount}`;
@@ -522,11 +660,11 @@
     }
 
     for (const track of stream.getVideoTracks()) {
-      readVideoFrames(track, streamId);
+      readVideoFrames(track, streamId, stream);
     }
 
     for (const track of stream.getAudioTracks()) {
-      readAudioSamples(track, streamId);
+      readAudioSamples(track, streamId, stream);
     }
   };
 

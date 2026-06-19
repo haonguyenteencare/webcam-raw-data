@@ -1,8 +1,48 @@
 const fileInput = document.querySelector("#file");
+const exportSessionButton = document.querySelector("#export-session");
 const summaryElement = document.querySelector("#summary");
 const framesElement = document.querySelector("#frames");
 const audioElement = document.querySelector("#audio");
 const recordingsElement = document.querySelector("#recordings");
+
+exportSessionButton.addEventListener("click", async () => {
+  const originalText = exportSessionButton.textContent;
+  exportSessionButton.disabled = true;
+  exportSessionButton.textContent = "Fetching data...";
+
+  try {
+    // We don't have a specific tabId here, so we'll ask background for the "latest" session or all sessions
+    // For simplicity in PoC, we'll ask for the first active Meet session
+    const { persistentSessions = {} } = await chrome.storage.session.get("persistentSessions");
+    const sessions = Object.values(persistentSessions);
+
+    if (sessions.length === 0) {
+      alert("Không tìm thấy dữ liệu phiên nào đang hoạt động.");
+      return;
+    }
+
+    // Pick the most recent session
+    const session = sessions.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))[0];
+    
+    const json = JSON.stringify(session, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${session.id || 'session'}.json`;
+    a.click();
+    
+    URL.revokeObjectURL(url);
+    alert(`Đã export thành công phiên: ${session.id}`);
+  } catch (error) {
+    console.error("Export failed:", error);
+    alert("Export thất bại: " + error.message);
+  } finally {
+    exportSessionButton.disabled = false;
+    exportSessionButton.textContent = originalText;
+  }
+});
 
 const makeCard = (metaText) => {
   const card = document.createElement("article");

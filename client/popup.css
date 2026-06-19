@@ -158,3 +158,38 @@ pre {
   border-radius: 6px;
   background: #111827;
 }
+.status-panel {
+  grid-template-columns: 1fr 1fr;
+  padding: 8px 12px;
+  background: #fdfdfd;
+}
+
+.indicator {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.indicator .label {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.indicator .value {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.value.online {
+  color: #12b76a;
+}
+
+.value.offline {
+  color: #f04438;
+}
+
+.value.unknown {
+  color: #667085;
+}
